@@ -33,10 +33,10 @@ archiveRegex version =
 
 fixSrcUrl :: Text -> Version -> Version -> FilePath -> Text -> Text -> Sh Text
 fixSrcUrl packageName oldVersion newVersion derivationFile attrPath oldSrcUrl = do
-  nixpkgsPath <- setupNixpkgs
+  setupNixpkgs
   oldDerivationName <-
     T.strip <$>
-    cmd "nix" "eval" "-f" nixpkgsPath "--raw" ("pkgs." <> attrPath <> ".name")
+    cmd "nix" "eval" "-f" "." "--raw" ("pkgs." <> attrPath <> ".name")
   let newDerivationName = T.replace oldVersion newVersion oldDerivationName
   name <-
     T.strip <$>

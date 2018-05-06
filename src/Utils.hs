@@ -1,5 +1,6 @@
 {-# LANGUAGE ExtendedDefaultRules #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 
 module Utils
@@ -15,24 +16,31 @@ module Utils
   , ExitCode(..)
   ) where
 
-import Control.Exception (Exception)
-import Data.Semigroup ((<>))
-import Data.Text (Text)
+import           Control.Exception (Exception)
+import           Data.Semigroup ((<>))
+import           Data.Text (Text)
 import qualified Data.Text as T
-import Prelude hiding (FilePath)
-import Shelly
+import           Monad (M (..), Version, Options (..))
+import           Prelude hiding (FilePath)
+import           Shelly.Lifted
+  ( liftSh
+  , lastExitCode
+  , errExit
+  , cd
+  , setenv
+  , cmd
+  , toTextIgnore
+  , unlessM
+  , test_e
+  , (</>)
+  , get_env_text
+  , MonadSh
+  , MonadShControl
+  )
 
 default (T.Text)
 
-type Version = Text
-
-data Options = Options
-  { dryRun :: Bool
-  , workingDir :: FilePath
-  , githubToken :: Text
-  }
-
-setupNixpkgs :: Sh FilePath
+setupNixpkgs :: MonadSh m => m ()
 setupNixpkgs = do
   home <- get_env_text "HOME"
   let nixpkgsPath = home </> ".cache" </> "nixpkgs"
@@ -41,19 +49,19 @@ setupNixpkgs = do
     cd nixpkgsPath
     cmd "git" "remote" "add" "upstream" "https://github.com/NixOS/nixpkgs"
     cmd "git" "fetch" "upstream"
+  setenv "NIX_PATH" ("nixpkgs=" <> toTextIgnore nixpkgsPath)
   cd nixpkgsPath
-  return nixpkgsPath
 
-canFail :: Sh a -> Sh a
+canFail :: MonadShControl m => m a -> m a
 canFail = errExit False
 
-succeded :: Sh a -> Sh Bool
+succeded :: (MonadShControl m, MonadSh m) => m a -> m Bool
 succeded s = do
   canFail s
   status <- lastExitCode
   return (status == 0)
 
-orElse :: Sh a -> Sh a -> Sh a
+orElse :: M m => m a -> m a -> m a
 orElse a b = do
   v <- canFail a
   status <- lastExitCode

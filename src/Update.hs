@@ -2,6 +2,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 
@@ -9,18 +10,21 @@ module Update
   ( updateAll
   ) where
 
-import Check (checkResult)
-import Clean (fixSrcUrl)
-import Control.Exception (SomeException, throw, toException)
-import Control.Monad (forM_)
-import Data.Maybe (fromMaybe)
-import Data.Semigroup ((<>))
+import           Check (checkResult)
+import           Clean (fixSrcUrl)
+import           Control.Exception (SomeException, throw, toException)
+import           Control.Monad (forM_)
+import           Control.Monad.Except (MonadError, ExceptT (..), throwError, runExceptT)
+import           Control.Monad.IO.Class (liftIO)
+import           Control.Monad.Reader (MonadReader (..), runReaderT)
+import           Data.Maybe (fromMaybe)
+import           Data.Semigroup ((<>))
+import           Data.Text (Text)
 import qualified Data.Text as T
-import Data.Text (Text)
-import Data.Time.Clock (getCurrentTime)
-import Data.Time.Format (defaultTimeLocale, formatTime, iso8601DateFormat)
+import           Data.Time.Clock (getCurrentTime)
+import           Data.Time.Format (defaultTimeLocale, formatTime, iso8601DateFormat)
 import qualified File
-import Git
+import           Git
   ( autoUpdateBranchExists
   , checkoutAtMergeBase
   , cleanAndResetToMaster
@@ -31,9 +35,35 @@ import Git
   , commit
   , pr
   )
-import NeatInterpolation (text)
-import Shelly
-import Utils
+import           Monad (M (..), UpdateEnv (..))
+import           NeatInterpolation (text)
+import           Shelly
+  ( ShellyHandler (..)
+  )
+import           Shelly.Lifted
+  ( liftSh
+  , MonadSh
+  , cmd
+  , when
+  , Sh (..)
+  , sleep
+  , (-|-)
+  , sub
+  , fromText
+  , whenM
+  , unless
+  , catches_sh
+  , catch_sh
+  , mkdir_p
+  , appendfile
+  , readfile
+  , touchfile
+  , readfile
+  , (</>)
+  , toTextIgnore
+  , shelly
+  )
+import           Utils
   ( ExitCode(..)
   , Options(..)
   , Version
@@ -47,11 +77,11 @@ import Utils
 
 default (T.Text)
 
-errorExit' :: (Text -> Sh ()) -> Text -> Text -> Sh a
-errorExit' log branchName message = do
-  cleanup branchName
-  log message
-  throw (ExitCode 1)
+errorExit :: M m => Text -> m a
+errorExit message = do
+  bn <- askBranchName
+  liftSh $ cleanup bn
+  throwError message
 
 nameBlackList :: [(Text -> Bool, Text)]
 nameBlackList =
@@ -93,14 +123,14 @@ contentBlacklist =
   , ("buildPerlPackage", "Derivation contains buildPerlPackage.")
   ]
 
-nixEval' :: (Text -> Sh Text) -> Text -> Sh Text
-nixEval' errorExit expr =
+nixEval :: M m => Text -> m Text
+nixEval expr =
   (T.strip <$> cmd "nix" "eval" "-f" "." expr) `orElse`
   errorExit ("nix eval failed for " <> expr)
 
-rawEval' :: (Text -> Sh Text) -> Text -> Sh Text
-rawEval' errorExit expr =
-  (T.strip <$> cmd "nix" "eval" "-f" "." "--raw" expr) `orElse`
+rawEval :: M m => Text -> m Text
+rawEval expr =
+  (T.strip <$> (liftSh $ cmd "nix" "eval" "-f" "." "--raw" expr)) `orElse`
   errorExit ("raw nix eval failed for " <> expr)
 
 log' logFile msg
@@ -122,6 +152,11 @@ updateAll options = do
   log "New run of ups.sh"
   updateLoop options log (parseUpdates updates)
 
+instance MonadSh m => MonadSh (ExceptT e m) where
+    liftSh m = ExceptT $ do
+        a <- liftSh m
+        return (Right a)
+
 updateLoop ::
      Options
   -> (Text -> Sh ())
@@ -133,26 +168,39 @@ updateLoop options log (Left e:moreUpdates) = do
   updateLoop options log moreUpdates
 updateLoop options log (Right (package, oldVersion, newVersion):moreUpdates) = do
   log (package <> " " <> oldVersion <> " -> " <> newVersion)
-  updated <-
-    catch_sh
-      (updatePackage options log package oldVersion newVersion)
-      (\case
-         ExitCode 0 -> return True
-         ExitCode _ -> return False)
-  if updated
-    then log "SUCCESS"
-    else log "FAIL"
+  let env = UpdateEnv package oldVersion newVersion options
+
+  result <- runExceptT (runReaderT (shelly updatePackage) env)
+  case result of
+    Left error -> log error >> log "FAIL"
+    Right () -> log "SUCCESS"
   updateLoop options log moreUpdates
 
-updatePackage ::
-     Options -> (Text -> Sh ()) -> Text -> Version -> Version -> Sh Bool
-updatePackage options log packageName oldVersion newVersion = do
-  nixpkgsPath <- setupNixpkgs
-  setenv "NIX_PATH" ("nixpkgs=" <> toTextIgnore nixpkgsPath)
-  let branchName = "auto-update/" <> packageName
-  let errorExit = errorExit' log branchName
-  let nixEval = nixEval' errorExit
-  let rawEval = rawEval' errorExit
+askBranchName :: MonadReader UpdateEnv m => m Text
+askBranchName = do
+  updateEnv <- ask
+  return $ "auto-update/" <> packageName updateEnv
+
+askOptions :: MonadReader UpdateEnv m => m Options
+askOptions = options <$> ask
+
+askPackageName :: MonadReader UpdateEnv m => m Text
+askPackageName = packageName <$> ask
+
+askNewVersion :: MonadReader UpdateEnv m => m Version
+askNewVersion = newVersion <$> ask
+
+askOldVersion :: MonadReader UpdateEnv m => m Version
+askOldVersion = oldVersion <$> ask
+
+updatePackage :: M m => m ()
+updatePackage = do
+  liftSh setupNixpkgs
+  branchName <- askBranchName
+  options <- askOptions
+  packageName <- askPackageName
+  newVersion <- askNewVersion
+  oldVersion <- askOldVersion
   -- Check whether requested version is newer than the current one
   versionComparison <-
     nixEval
@@ -168,7 +216,7 @@ updatePackage options log packageName oldVersion newVersion = do
     when (isBlacklisted packageName) $ errorExit message
   fetchIfStale
   whenM
-    (autoUpdateBranchExists packageName)
+    (liftSh $ autoUpdateBranchExists packageName)
     (errorExit "Update branch already on origin.")
   cleanAndResetToMaster
     -- This is extremely slow but will give us better results
@@ -194,118 +242,113 @@ updatePackage options log packageName oldVersion newVersion = do
     fromText . T.strip <$>
     cmd "env" "EDITOR=echo" "nix" "edit" attrPath "-f" "." `orElse`
     errorExit "Couldn't find derivation file."
-  flip
-    catches_sh
-    [ ShellyHandler (\(ex :: ExitCode) -> throw ex)
-    , ShellyHandler (\(ex :: SomeException) -> errorExit (T.pack (show ex)))
-    ] $ do
-    numberOfFetchers <-
-      tRead <$>
-      canFail
-        (cmd
-           "grep"
-           "-Ec"
-           "fetchurl {|fetchgit {|fetchFromGitHub {"
-           derivationFile)
-    unless ((numberOfFetchers :: Int) <= 1) $
-      errorExit $ "More than one fetcher in " <> toTextIgnore derivationFile
-    derivationContents <- readfile derivationFile
-    forM_ contentBlacklist $ \(offendingContent, message) ->
-      when (offendingContent `T.isInfixOf` derivationContents) $
-      errorExit message
-    unless (checkAttrPathVersion attrPath newVersion) $
-      errorExit
-        ("Version in attr path " <> attrPath <> " not compatible with " <>
-         newVersion)
-    -- Make sure it hasn't been updated on master
-    cmd "grep" oldVersion derivationFile `orElse`
-      errorExit "Old version not present in master derivation file."
-    -- Make sure it hasn't been updated on staging
-    cleanAndResetToStaging
-    cmd "grep" oldVersion derivationFile `orElse`
-      errorExit "Old version not present in staging derivation file."
-    checkoutAtMergeBase branchName
-    oldHash <-
-      rawEval ("pkgs." <> attrPath <> ".src.drvAttrs.outputHash") `orElse`
-      errorExit
-        ("Could not find old output hash at " <> attrPath <>
-         ".src.drvAttrs.outputHash.")
-    oldSrcUrl <-
-      rawEval
-        ("(let pkgs = import ./. {}; in builtins.elemAt pkgs." <> attrPath <>
-         ".src.drvAttrs.urls 0)")
-    File.replace oldVersion newVersion derivationFile
-    newSrcUrl <-
-      rawEval
-        ("(let pkgs = import ./. {}; in builtins.elemAt pkgs." <> attrPath <>
-         ".src.drvAttrs.urls 0)")
-    when (oldSrcUrl == newSrcUrl) $ errorExit "Source url did not change."
-    newHash <-
-      canFail (T.strip <$> cmd "nix-prefetch-url" "-A" (attrPath <> ".src")) `orElse`
-      fixSrcUrl
-        packageName
-        oldVersion
-        newVersion
-        derivationFile
-        attrPath
-        oldSrcUrl `orElse`
-      errorExit "Could not prefetch new version URL."
-    when (oldHash == newHash) $ errorExit "Hashes equal; no update necessary"
-    File.replace oldHash newHash derivationFile
-    cmd
-      "nix-build"
-      "--option" "sandbox" "true"
-      "--option" "restrict-eval" "true"
-      "-A" attrPath `orElse` do
-      buildLog <-
-        T.unlines . reverse . take 30 . reverse . T.lines <$>
-        cmd "nix" "log" "-f" "." attrPath
-      errorExit ("nix build failed.\n" <> buildLog)
-    result <-
-      fromText <$>
-      (T.strip <$>
-       (cmd "readlink" "./result" `orElse` cmd "readlink" "./result-bin")) `orElse`
-      errorExit "Could not find result link."
-    resultCheckReport <- sub (checkResult options result newVersion)
-    maintainers <-
-      rawEval
-        ("(let pkgs = import ./. {}; gh = m : m.github or \"\"; nonempty = s: s != \"\"; addAt = s: \"@\"+s; in builtins.concatStringsSep \" \" (map addAt (builtins.filter nonempty (map gh pkgs." <>
-         attrPath <>
-         ".meta.maintainers or []))))")
-    let maintainersCc =
-          if not (T.null maintainers)
-            then "\n\ncc " <> maintainers <> " for review"
-            else ""
-    let commitMessage =
-          [text|
-                $attrPath: $oldVersion -> $newVersion
 
-                Semi-automatic update generated by https://github.com/ryantm/nixpkgs-update tools.
+  numberOfFetchers <-
+    tRead <$>
+    canFail
+      (cmd
+         "grep"
+         "-Ec"
+         "fetchurl {|fetchgit {|fetchFromGitHub {"
+         derivationFile)
+  unless ((numberOfFetchers :: Int) <= 1) $
+    errorExit $ "More than one fetcher in " <> toTextIgnore derivationFile
+  derivationContents <- readfile derivationFile
+  forM_ contentBlacklist $ \(offendingContent, message) ->
+    when (offendingContent `T.isInfixOf` derivationContents) $
+    errorExit message
+  unless (checkAttrPathVersion attrPath newVersion) $
+    errorExit
+      ("Version in attr path " <> attrPath <> " not compatible with " <>
+       newVersion)
+  -- Make sure it hasn't been updated on master
+  cmd "grep" oldVersion derivationFile `orElse`
+    errorExit "Old version not present in master derivation file."
+  -- Make sure it hasn't been updated on staging
+  cleanAndResetToStaging
+  cmd "grep" oldVersion derivationFile `orElse`
+    errorExit "Old version not present in staging derivation file."
+  checkoutAtMergeBase branchName
+  oldHash <-
+    rawEval ("pkgs." <> attrPath <> ".src.drvAttrs.outputHash") `orElse`
+    errorExit
+      ("Could not find old output hash at " <> attrPath <>
+       ".src.drvAttrs.outputHash.")
+  oldSrcUrl <-
+    rawEval
+      ("(let pkgs = import ./. {}; in builtins.elemAt pkgs." <> attrPath <>
+       ".src.drvAttrs.urls 0)")
+  File.replace oldVersion newVersion derivationFile
+  newSrcUrl <-
+    rawEval
+      ("(let pkgs = import ./. {}; in builtins.elemAt pkgs." <> attrPath <>
+       ".src.drvAttrs.urls 0)")
+  when (oldSrcUrl == newSrcUrl) $ errorExit "Source url did not change."
+  newHash <-
+    canFail (T.strip <$> cmd "nix-prefetch-url" "-A" (attrPath <> ".src")) `orElse`
+    fixSrcUrl
+      packageName
+      oldVersion
+      newVersion
+      derivationFile
+      attrPath
+      oldSrcUrl `orElse`
+    errorExit "Could not prefetch new version URL."
+  when (oldHash == newHash) $ errorExit "Hashes equal; no update necessary"
+  File.replace oldHash newHash derivationFile
+  cmd
+    "nix-build"
+    "--option" "sandbox" "true"
+    "--option" "restrict-eval" "true"
+    "-A" attrPath `orElse` do
+    buildLog <-
+      T.unlines . reverse . take 30 . reverse . T.lines <$>
+      cmd "nix" "log" "-f" "." attrPath
+    errorExit ("nix build failed.\n" <> buildLog)
+  result <-
+    fromText <$>
+    (T.strip <$>
+     (cmd "readlink" "./result" `orElse` cmd "readlink" "./result-bin")) `orElse`
+    errorExit "Could not find result link."
+  resultCheckReport <- sub (checkResult options result newVersion)
+  maintainers <-
+    rawEval
+      ("(let pkgs = import ./. {}; gh = m : m.github or \"\"; nonempty = s: s != \"\"; addAt = s: \"@\"+s; in builtins.concatStringsSep \" \" (map addAt (builtins.filter nonempty (map gh pkgs." <>
+       attrPath <>
+       ".meta.maintainers or []))))")
+  let maintainersCc =
+        if not (T.null maintainers)
+          then "\n\ncc " <> maintainers <> " for review"
+          else ""
+  let commitMessage =
+        [text|
+              $attrPath: $oldVersion -> $newVersion
 
-                This update was made based on information from https://repology.org/metapackage/$packageName/versions.
+              Semi-automatic update generated by https://github.com/ryantm/nixpkgs-update tools.
 
-                These checks were done:
+              This update was made based on information from https://repology.org/metapackage/$packageName/versions.
 
-                - built on NixOS
-                $resultCheckReport
-            |]
-    commit commitMessage
-    -- Try to push it three times
-    push branchName options `orElse` push branchName options `orElse`
-      push branchName options
-    isBroken <-
-      nixEval
-        ("(let pkgs = import ./. {}; in pkgs." <> attrPath <>
-         ".meta.broken or false)")
-    let brokenWarning =
-          if isBroken == "true"
-            then "- WARNING: Package has meta.broken=true; Please manually test this package update and remove the broken attribute."
-            else ""
-    let prMessage = commitMessage <> brokenWarning <> maintainersCc
-    untilOfBorgFree
-    pr prMessage
-    cleanAndResetToMaster
-    return True
+              These checks were done:
+
+              - built on NixOS
+              $resultCheckReport
+          |]
+  commit commitMessage
+  -- Try to push it three times
+  push branchName options `orElse` push branchName options `orElse`
+    push branchName options
+  isBroken <-
+    nixEval
+      ("(let pkgs = import ./. {}; in pkgs." <> attrPath <>
+       ".meta.broken or false)")
+  let brokenWarning =
+        if isBroken == "true"
+          then "- WARNING: Package has meta.broken=true; Please manually test this package update and remove the broken attribute."
+          else ""
+  let prMessage = commitMessage <> brokenWarning <> maintainersCc
+  untilOfBorgFree
+  pr prMessage
+  cleanAndResetToMaster
 
 untilOfBorgFree :: Sh ()
 untilOfBorgFree = do
