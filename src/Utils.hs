@@ -24,11 +24,12 @@ module Utils
     nixCommonOptions,
     runLog,
     getGithubToken,
+    stripQuotes,
   )
 where
 
-import Data.List (isSuffixOf)
 import Data.Bits ((.|.))
+import Data.List (isSuffixOf)
 import Data.Maybe (fromJust)
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
@@ -203,7 +204,7 @@ setupNixpkgs githubt = do
       unless exists $ do
         proc "hub" ["clone", "nixpkgs", fp]
           & System.Process.Typed.setEnv -- requires that user has forked nixpkgs
-          [("GITHUB_TOKEN" :: String, githubt & T.unpack)]
+            [("GITHUB_TOKEN" :: String, githubt & T.unpack)]
           & runProcess_
         setCurrentDirectory fp
         shell "git remote add upstream https://github.com/NixOS/nixpkgs"
@@ -302,3 +303,6 @@ getGithubToken = do
   lt <- localToken
   ht <- hubConfigToken
   return $ fromJust (et <|> lt <|> ht)
+
+stripQuotes :: Text -> Maybe Text
+stripQuotes = T.stripPrefix "\"" >=> T.stripSuffix "\""
